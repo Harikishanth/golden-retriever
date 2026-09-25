@@ -30,6 +30,25 @@ icacls "ml-challenge.pem" /grant:r "$($env:USERNAME):R"
 ssh -i "ml-challenge.pem" ubuntu@ec2-16-171-199-121.eu-north-1.compute.amazonaws.com
 ```
 
+**IMPORTANT — always use tmux so your process survives disconnects:**
+```bash
+# First time: create a named session
+tmux new -s myname
+
+# Run your commands inside tmux...
+
+# Disconnected? SSH back in, then reattach:
+tmux attach -t myname
+
+# Detach on purpose (keep it running): press Ctrl+B, then D
+# List sessions: tmux ls
+# Kill a session: tmux kill-session -t myname
+```
+
+Each person should use their own session name (`hari`, `reshma`, `jehrome`).
+If you see "sessions should be nested" — you're already inside tmux. Just run your commands.
+If you see no output after starting a script — **WAIT**. Loading millions of rows takes 1-2 min of silence.
+
 **EC2 layout:**
 ```
 ~/student_resource/dataset/       <- all TSV files (train + test)
