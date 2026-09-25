@@ -1,11 +1,15 @@
 # Claude / agent handoff — Amazon ML Challenge 2026
 
-**Stamp:** `2026-09-25 ~16:30 IST`
+**Stamp:** `2026-09-25 ~21:00 IST`
 **Team:** Da Big Three (Harikishanth R +2)
-**Machine:** `D:\ML challenge` (Windows 11, Python 3.14.2)
+**Machine (primary):** AWS EC2 r5.2xlarge (64GB RAM, eu-north-1), Ubuntu 26.04, Python 3.14.4
+**Machine (local):** `D:\ML challenge` (Windows 11, Python 3.14.2) — code editing only, too slow for pipeline
 **Contest clock:** 25 Sep 00:00 → 27 Sep 23:59 IST. **5 submits/day.** Public + private; final = private.
-**Installed:** numpy 2.4.0, sklearn 1.8.0, pandas 2.3.3, **rapidfuzz 3.14.6**, **lightgbm 4.7.0**
-**Not installed locally (but available on cloud):** faiss-cpu, sentence-transformers, polars
+**EC2 installed:** rapidfuzz 3.14.6, lightgbm 4.7.0, sentence-transformers 6.1.0, faiss-cpu 1.15.1, torch 2.14.0, numpy, pandas, scikit-learn
+**EC2 data:** `/home/ubuntu/student_resource/dataset/` (downloaded from Unstop CDN in 3s)
+**EC2 cost:** ~$0.50/hr, ~$100 AWS credits available. STOP WHEN IDLE.
+**GitHub:** https://github.com/Harikishanth/golden-retriever (code only, no dataset)
+**Status:** Zero Unstop submissions. About to run first BM25+LightGBM holdout on EC2.
 
 ---
 

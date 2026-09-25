@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-ROOT = Path(r"D:\ML challenge\dataset\student_resource\dataset")
+import os
+_root_env = os.environ.get("DATASET_ROOT")
+if _root_env:
+    ROOT = Path(_root_env)
+elif Path("/home/ubuntu/student_resource/dataset").exists():
+    ROOT = Path("/home/ubuntu/student_resource/dataset")
+else:
+    ROOT = Path(r"D:\ML challenge\dataset\student_resource\dataset")
 
 
 def iter_source(path: Path):

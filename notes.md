@@ -23,11 +23,12 @@ v4 (running ~16:00+): BM25 blocking + LightGBM + 15 features (+rapidfuzz). LOCAL
   STATUS: still running in background, may finish tonight.
   model.json was DELETED before v4 started. No submittable model on disk right now.
 
---- Cloud strategy (decided ~16:00) ---
-Move to Kaggle/AWS/Vultr to avoid local RAM bottleneck.
-Kaggle: 29GB RAM, T4 GPU, free. Run BM25+LightGBM in ~35 min.
-AWS: ml.r5.2xlarge (64GB) ~$0.50/hr. Already have $200 credits.
-Vultr: GPU instance available.
+--- Cloud strategy (decided ~16:00, executed ~20:45 IST) ---
+Moved to AWS EC2 r5.2xlarge (64GB RAM, eu-north-1). Ubuntu 26.04.
+Dataset downloaded from Unstop CDN directly on EC2 (3 seconds for 1GB).
+All deps installed: rapidfuzz, lightgbm, sentence-transformers, faiss-cpu, torch.
+GitHub repo: https://github.com/Harikishanth/golden-retriever
+io_utils.py ROOT auto-detects EC2 vs local path.
 
 --- Installed packages (local machine, 2026-09-25) ---
 rapidfuzz 3.14.6
