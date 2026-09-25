@@ -63,6 +63,15 @@ REGION = {
 _COMBINING = dict.fromkeys(map(chr, range(0x0300, 0x0370)), None)
 
 
+def clean_noise(s: str) -> str:
+    """Strip emails, phone numbers, social handles and hashtags."""
+    s = re.sub(r'\S+@\S+\.\S+', ' ', s)
+    s = re.sub(r'[\+\(]?[\d\s\-\(\)]{9,15}', ' ', s)
+    s = re.sub(r'@\w+', ' ', s)
+    s = re.sub(r'#\w+', ' ', s)
+    return s
+
+
 def fold(s: str) -> str:
     """Lowercase, strip accents, drop replacement chars, '&' -> 'and'."""
     s = s.replace("\ufffd", " ").replace("&", " and ")
@@ -75,6 +84,7 @@ def tokens(s: str) -> list[str]:
 
 
 def name_tokens(s: str) -> list[str]:
+    s = clean_noise(s)
     s = re.sub(r"(https?://|www\.)", " ", s)
     s = re.sub(r"\.(com|in|fr|net|org|co|io)\b", " ", s, flags=re.I)
     out = [t for t in tokens(s) if t not in SUFFIXES and t not in NOISE_WORDS and not t.isdigit()]

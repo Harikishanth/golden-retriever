@@ -20,12 +20,19 @@ try:
 except ImportError:
     _HAS_RAPIDFUZZ = False
 
+try:
+    import jellyfish as _jf
+    _HAS_JELLYFISH = True
+except ImportError:
+    _HAS_JELLYFISH = False
+
 FEATURE_NAMES = [
     "idf_name_jac", "name_contain", "char_sim", "house_agree",
     "addr_jac", "addr_exact", "city_agree", "name_rare", "name_len_ratio",
     "jaro_winkler", "tfidf_cos",
     "rf_token_sort", "rf_token_set", "rf_partial",
     "rf_addr_sort",
+    "phonetic_match", "name_rarity_log",
 ]
 
 _FALLBACK_COEF = [2.0, 1.0, 2.5, 2.5, 1.0, 2.5, 0.5, 1.0, 0.5, 2.0, 2.0, 2.0, 2.0, 1.0, 1.0]
@@ -164,6 +171,18 @@ def features(s1f: tuple, s1_country: str, candf: tuple,
         ]
     else:
         base += [0.0, 0.0, 0.0, 0.0]
+
+    # phonetic_match
+    if _HAS_JELLYFISH and n1 and n2:
+        base.append(1.0 if _jf.soundex(n1) == _jf.soundex(n2) else 0.0)
+    else:
+        base.append(0.0)
+
+    # name_rarity_log — continuous version of name_rare
+    import math
+    f = freq.get((c, n1), 1)
+    base.append(math.log(1.0 / max(f, 1) + 1.0))
+
     return base
 
 
