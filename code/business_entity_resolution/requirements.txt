@@ -1,0 +1,7 @@
+# pinned to what this laptop already has (2026-09-25)
+pandas==2.3.3
+numpy==2.4.0
+scikit-learn==1.8.0
+# optional, not required for the rule baseline:
+# rapidfuzz
+# lightgbm
