@@ -104,10 +104,10 @@ def batch_features(s1_name: str, s1_addr: str, s1_country: str,
             n2 = sum(idf.get(t, 1.0)**2 for t in t2)**0.5
             X[i, 10] = dot / (n1 * n2) if (n1 and n2) else 0.0
 
-    # jaro_winkler — batch via rapidfuzz
+    # jaro_winkler — batch via rapidfuzz (must match match.py's jaro_winkler feature)
     if _HAS_RAPIDFUZZ and c_fn:
-        jw_scores = _rfp.cdist([s1_fn], c_fn, scorer=_fuzz.WRatio, score_cutoff=0)
-        X[:, 9] = jw_scores[0] / 100.0
+        jw_scores = _rfp.cdist([s1_fn], c_fn, scorer=_fuzz.jaro_winkler_similarity, score_cutoff=0)
+        X[:, 9] = jw_scores[0]  # already 0-1, no /100
 
         # rf_token_sort
         ts_scores = _rfp.cdist([s1_fn], c_fn, scorer=_fuzz.token_sort_ratio, score_cutoff=0)
