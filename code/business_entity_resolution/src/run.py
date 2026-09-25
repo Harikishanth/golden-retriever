@@ -22,6 +22,7 @@ from blocking import build_index_and_idf, candidates_for  # noqa: E402
 from evaluate import f05_one, fmt, summarize  # noqa: E402
 from io_utils import ROOT, iter_ground_truth, iter_source, write_submission  # noqa: E402
 from match import FEATURE_NAMES, features, name_freq, precompute  # noqa: E402
+from fast_features import batch_features  # noqa: E402
 
 HERE = Path(__file__).resolve().parents[1]
 HOLDOUT_N = 100_000
@@ -255,27 +256,31 @@ def run_test():
     cands_out: dict[str, list[str]] = {}
     capped_total = 0
 
-    # Batch to avoid OOM on full test set
+    # Batch to avoid OOM on full test set — uses vectorized fast_features
     for batch_start in range(0, len(order), BATCH_ENTITIES):
         batch = order[batch_start: batch_start + BATCH_ENTITIES]
-        feat_list, spans = [], []
+        X_parts, spans = [], []
         for sid in batch:
-            _name, _addr, country, s1f = s1[sid]
-            cands, was_capped = candidates_for(index, _name, _addr, country, idf)
+            s1_name, s1_addr, country, _s1f = s1[sid]
+            cands, was_capped = candidates_for(index, s1_name, s1_addr, country, idf)
             capped_total += was_capped
             cands_out[sid] = cands
-            start = len(feat_list)
-            for c in cands:
-                cname, caddr, _ = pool[c]
-                candf = precompute(cname, caddr)
-                feat_list.append(features(s1f, country, candf, idf, freq))
-            spans.append((sid, start, len(feat_list), cands))
+            if cands:
+                cand_names = [pool[c][0] for c in cands]
+                cand_addrs = [pool[c][1] for c in cands]
+                X_ent = batch_features(s1_name, s1_addr, country,
+                                       cand_names, cand_addrs, idf, freq)
+                start = sum(len(x) for x in X_parts)
+                X_parts.append(X_ent)
+            else:
+                start = sum(len(x) for x in X_parts)
+            spans.append((sid, start, start + len(cands), cands))
 
-        if feat_list:
-            X_batch = np.array(feat_list, dtype=np.float32)
+        if X_parts:
+            X_batch = np.concatenate(X_parts, axis=0).astype(np.float32)
             scores = _clf_scores(clf, X_batch)
             for sid, start, end, cands in spans:
-                matches[sid] = [cands[j - start] for j in range(start, end) if scores[j] >= threshold]
+                matches[sid] = [cands[j - start] for j in range(end - start) if scores[start + j] >= threshold]
         else:
             for sid, _, _, _ in spans:
                 matches[sid] = []
