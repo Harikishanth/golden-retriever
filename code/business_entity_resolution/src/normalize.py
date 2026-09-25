@@ -64,11 +64,10 @@ _COMBINING = dict.fromkeys(map(chr, range(0x0300, 0x0370)), None)
 
 
 def clean_noise(s: str) -> str:
-    """Strip emails, phone numbers, social handles and hashtags."""
-    s = re.sub(r'\S+@\S+\.\S+', ' ', s)
-    s = re.sub(r'[\+\(]?[\d\s\-\(\)]{9,15}', ' ', s)
-    s = re.sub(r'@\w+', ' ', s)
-    s = re.sub(r'#\w+', ' ', s)
+    """Strip emails and social handles — safe to remove, never business names."""
+    s = re.sub(r'\S+@\S+\.\S+', ' ', s)   # emails
+    s = re.sub(r'@\w+', ' ', s)            # @handles
+    s = re.sub(r'#\w+', ' ', s)            # #hashtags
     return s
 
 
