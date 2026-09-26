@@ -1,0 +1,63 @@
+# =========================
+# Dataset - NEVER COMMIT
+# =========================
+dataset/
+dataset.zip
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Models / generated files
+# =========================
+*.pkl
+*.pickle
+*.joblib
+*.lgb
+*.model
+*.pt
+*.pth
+*.onnx
+
+# Large generated artifacts
+*.npy
+*.npz
+*.parquet
+*.feather
+
+# =========================
+# Experiment outputs
+# =========================
+output/
+outputs/
+artifacts/
+checkpoints/
+
+# =========================
+# Secrets
+# =========================
+.env
+*.pem
+*.key
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/

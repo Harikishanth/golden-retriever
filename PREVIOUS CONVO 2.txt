@@ -1,0 +1,811 @@
+ok dude now teach me what and all you v]have doing ,why uve had done those, what couldve been better approach etc, like i needd to learn the code as well
+
+  Thought for 8s
+
+I'll walk through what's been built here, the reasoning behind it, and alternative approaches. Let me read the key files first to give you a comprehensive breakdown.
+
+  Thought for 4s, read 3 files
+
+Now let me look at a few more key files to give you the complete picture:
+
+  Thought for 4s, read 2 files, listed 1 directory
+
+Alright, let me teach you this entire codebase from the ground up! This is an entity resolution system for the Amazon ML Challenge 2026. Let me break it down systematically:
+
+---
+
+THE PROBLEM
+
+You have duplicate business records across 3 data sources. Same company appears as:
+- "McDonald's Restaurant Corp" in Source 1
+- "McDonalds Inc" in Source 2
+- "MacDonald's Corporation" in Source 3
+
+Goal: Match Source 1 entities to Sources 2+3, maximize F0.5 score (precision-heavy).
+
+---
+
+THE ARCHITECTURE (4-Stage Pipeline)
+
+1. NORMALIZATION (normalize.py)
+
+What it does: Cleans messy real-world data into comparable tokens
+
+name_tokens("McDonald's LLC") → ["mcdonald"]  # removes suffixes, noise
+house_numbers("#4292, Unit 314") → {"4292", "314"}  # extracts numbers
+addr_tokens("123 M.G. Road Bengaluru") → ["mg", "road", "bengaluru"]
+
+Why these choices:
+- Legal suffixes removed (LLC, Inc, SARL) - they vary by country/vendor but don't identify the business
+- Accent stripping (Gúlf → gulf) - handles typos and encoding issues
+- Domain cleaning (dadaorlive.com → removed) - social media/emails aren't business names
+- Region normalization (Oregon ↔ OR, Maharashtra ↔ MH) - same place, different abbreviations
+
+What could be better:
+- ❌ No fuzzy phonetics in normalization - should've handled McDonald vs MacDonald here
+- ❌ Fixed stopword lists - brittle if you add a new country (currently US/India/France focused)
+- ✅ Smart move: The REGION dict handles city name aliases (Bombay → Mumbai)
+
+---
+
+2. BLOCKING (blocking.py)
+
+What it does: Finds candidate matches (reduces 1M² comparisons to ~150 per entity)
+
+Old approach (commit history shows this existed):
+- Hash-based blocking: exact match on (country, name_normalized, city)
+- Problem: Recall ceiling was only 83.4% - missed partial matches!
+
+Current approach: BM25-style token retrieval
+# Entity: "McDonald's MG Road Bengaluru"
+# Creates index keys: (country='IN', type='N', token='mcdonald')
+#                     (country='IN', type='A', token='mg')
+#                     (country='IN', type='H', token='4292')
+
+# Scoring for candidates:
+score = Σ(IDF(shared_name_token) * 2.0) +  # Name weighted higher
+        Σ(IDF(shared_addr_token) * 1.2) +   # Address weighted lower
+        Σ(8.0 per matching house number)     # House# = strong signal
+
+Why this works:
+- "McDonald's" matches "McDonalds" (both index 'mcdonald')
+- "M.G. Road" matches "MG Road" (both index 'mg', 'road')
+- IDF weighting: rare tokens like 'starbucks' score higher than 'inc'
+
+Smart guard: MAX_POSTING=2000 - skips super-common tokens (saves RAM, they're useless anyway)
+
+What could be better:
+- ✅ Major win: Moving from hash-blocking to token-retrieval gave ~10% recall boost!
+- ⚠️ CAP=150 is hardcoded - no tuning for precision/recall tradeoff
+- ✅ Country-scoped index - prevents matching US companies to Indian ones
+
+---
+
+3. FEATURE ENGINEERING (match.py + fast_features.py)
+
+What it does: Converts a candidate pair into 17 numerical features
+
+Feature categories:
+
+A) String similarity (6 features)
+# Feature 0: IDF-weighted Jaccard on name tokens
+idf_name_jac = Σ(IDF(shared)) / Σ(IDF(union))
+
+# Feature 2: Trigram overlap on squashed names
+char_sim("mcdonald", "macdonald") = 0.85  # catches typos
+
+# Feature 9: Jaro-Winkler (rewards common prefix)
+jaro_winkler("McDonald", "MacDonald") = 0.96  # prefix bonus
+
+B) Exact signals (4 features)
+# Feature 3: house_agree - if house numbers overlap, strong match signal
+house_agree = 1.0 if {"4292", "314"} & {"4292"} else 0.0
+
+# Feature 5: addr_exact - long exact address = high confidence
+addr_exact = 1.0 if len(addr_squashed) >= 8 and addr1 == addr2 else 0.0
+
+# Feature 6: city_agree - same city = likely match
+city_agree = 1.0 if "bengaluru" == "bengaluru" else 0.0
+
+C) Rarity features (2 features)
+# Feature 7: name_rare (binary) - rare names more trustworthy
+name_rare = 1.0 if count("McDonald") < 4 else 0.0
+
+# Feature 16: name_rarity_log (continuous) - log(1/freq)
+name_rarity_log = log(1/freq + 1)  # smooth distribution
+
+D) Fuzzy ratios from rapidfuzz (5 features)
+rf_token_sort = token_sort_ratio("McDonald LLC", "LLC McDonald") / 100  # 1.0
+rf_token_set = token_set_ratio("A & B Co", "B and A Company") / 100     # high
+rf_partial = partial_ratio("McDonald's Restaurant", "McDonald") / 100    # 1.0
+rf_addr_sort = token_sort_ratio("123 MG Road", "MG Road 123") / 100
+
+E) Phonetic (1 feature)
+phonetic_match = 1.0 if soundex("McDonald") == soundex("MacDonald") else 0.0
+
+The fast_features.py optimization:
+
+Old approach (implied from comments):
+# Loop per pair in Python
+for cand in candidates:
+    features = compute_features(s1_entity, cand)  # SLOW
+
+New approach:
+# Vectorized batch computation using rapidfuzz.process.cdist
+X = batch_features(s1_name, s1_addr, country,
+                   all_cand_names, all_cand_addrs, idf, freq)
+# Returns: np.array of shape (num_candidates, 17)
+
+Performance: ~10x speedup on test run (from git commit messages)
+
+What could be better:
+- ✅ Great: Uses cdist to compute all pairwise similarities in one shot
+- ❌ Missed opportunity: Features 15-16 (phonetic, rarity) still loop in Python
+- ⚠️ Hardcoded magic: char_sim uses trigrams (n=3), no ablation test for n=2 or n=4
+
+---
+
+4. CLASSIFICATION & THRESHOLDING (run.py)
+
+Training (holdout mode):
+
+Phase 1: Data split
+HOLDOUT_N = 100,000 entities
+70k train, 30k validation
+
+Phase 2: Model training
+# Try LightGBM first (gradient boosted trees)
+LGBMClassifier(
+    n_estimators=1000, num_leaves=63, learning_rate=0.05,
+    scale_pos_weight=auto  # handles class imbalance
+)
+# + Early stopping on 30k val set
+
+# Fallback to Logistic Regression if LightGBM not installed
+
+Phase 3: Single-threshold sweep
+# Sweep threshold on 30k val: [0.05, 0.07, ..., 0.93]
+# Pick threshold that maximizes macro F0.5
+
+Phase 4: Re-train on full 100k + re-tune threshold
+# Model sees more data → threshold might shift slightly
+
+Phase 5: Two-threshold optimization ⭐ This is the recent innovation!
+
+The problem with single threshold:
+# Entity has 50 candidates, all score 0.45 (below threshold=0.50)
+# Prediction: {} (empty set = "singleton", no match found)
+# But: If top score was 0.49, it was ALMOST a match!
+
+The two-threshold strategy:
+singleton_threshold = match_threshold + 0.02 to 0.15
+
+if max(scores) < singleton_threshold:
+    predict {}  # Conservative: "nothing is close enough"
+else:
+    predict {c for c, score in scores if score >= match_threshold}
+
+Why this works:
+- High-confidence singletons: If even the best candidate scores poorly, it's truly standalone
+- Precision boost: Avoids false positives where a borderline match gets through
+
+From the code (lines 286-292):
+if best_f05_two > best_f05_full:
+    print(f"✓ Two-threshold improves F0.5: {best_f05_full:.4f} → {best_f05_two:.4f}")
+    use_two_threshold = True
+
+What could be better:
+- ✅ Smart: Uses multiprocessing to featurize 100k entities in parallel
+- ✅ Cache-friendly: Sets globals before fork() so workers share memory (copy-on-write)
+- ❌ No cross-validation: Single 70/30 split might be lucky/unlucky
+- ❌ No hyperparameter tuning: LightGBM params are hardcoded (no grid search)
+- ⚠️ Threshold search is coarse: 2% steps (0.05, 0.07, ...) - might miss optimal value
+
+---
+
+PERFORMANCE OPTIMIZATIONS DONE
+
+From your git commits:
+
+1. "Fix feature mismatch + use batch_features in holdout for 10x speedup"
+   - Migrated run.py to use fast_features.batch_features() instead of loops
+2. "Remove risky phone number regex from clean_noise"
+   - Initially tried extracting phone numbers - too brittle, removed
+3. "Add noise cleaning, phonetic match, and continuous name rarity features"
+   - Added features 15-16 (phonetic, rarity_log)
+4. "Fix jaro_winkler feature in fast_features — use jaro_winkler_similarity not WRatio"
+   - Bug: Was using wrong rapidfuzz scorer!
+5. "Add vectorized batch feature computation for fast test run"
+   - Created fast_features.py with numpy/rapidfuzz.cdist
+
+---
+
+WHAT COULD'VE BEEN DONE BETTER
+
+Architecture-level:
+
+1. ❌ No learned blocking: Could train a lightweight model to predict which candidates are worth scoring
+   - Current: Take top 150 by BM25
+   - Better: Train a binary classifier on cheap features, then rank by LightGBM
+2. ❌ No ensemble: Could combine multiple models (LightGBM + XGBoost + LR) and average scores
+3. ❌ No negative sampling strategy: Training sees all 150 candidates (149 negatives, 1 positive)
+   - Could've subsampled "easy negatives" to balance classes better
+
+Feature engineering:
+
+4. ❌ No edit distance: Levenshtein distance is a classic ER feature, completely absent
+5. ❌ No learned embeddings: Could've used Sentence-BERT to embed names/addresses → cosine similarity
+6. ❌ No interaction features: No name_match * addr_match or rare_name * high_score
+7. ⚠️ Phonetic only uses Soundex: Metaphone or Double-Metaphone are better (especially for non-English)
+
+Code quality:
+
+8. ❌ Globals for multiprocessing (_W_S1, _W_INDEX) - works but ugly. Should use functools.partial
+9. ❌ No logging framework: Uses print(..., flush=True) everywhere - hard to debug in production
+10. ❌ No config file: All hyperparameters hardcoded (CAP=150, HOLDOUT_N=100000, NUM_FEATURES=17)
+11. ✅ Good: Fallback from LightGBM → LogisticRegression if LightGBM not installed
+
+Evaluation:
+
+12. ❌ No ablation study: Which features actually matter? Could've tested dropping each feature
+13. ❌ No error analysis: Should've inspected false positives/negatives to find patterns
+14. ❌ No stratified split: 70/30 split is random - should stratify by country or frequency
+
+---
+
+THE SMART DECISIONS YOU MADE
+
+1. ✅ BM25 blocking instead of hash-blocking: Massive recall improvement
+2. ✅ Two-threshold strategy: Clever way to improve precision on singletons
+3. ✅ Vectorized features: 10x speedup by using rapidfuzz.cdist
+4. ✅ Multiprocessing: Parallelized featurization across CPU cores
+5. ✅ Early stopping: Prevents LightGBM overfitting
+6. ✅ IDF weighting: Both in blocking AND features - token importance matters
+7. ✅ House number matching: Strong signal, correctly weighted high
+8. ✅ Name rarity: Rare names are more trustworthy - great insight
+
+---
+
+HOW I'D IMPROVE THIS FOR PRODUCTION
+
+# 1. Config-driven
+config = yaml.load("config.yaml")  # CAP, thresholds, model params
+
+# 2. Proper logging
+import logging
+logger = logging.getLogger(__name__)
+logger.info(f"Loaded {len(s1)} entities")
+
+# 3. Feature store
+features = FeatureStore("features.parquet")  # Cache features
+
+# 4. Model registry
+mlflow.log_model(clf, "lgbm_v2")
+
+# 5. Active learning
+# Re-train on high-uncertainty predictions
+
+# 6. Monitoring
+# Track precision/recall drift over time
+
+---
+
+TL;DR FOR YOUR ML INTERVIEW
+
+▎ "We built a 4-stage entity resolution pipeline: normalization → BM25 blocking → 17-feature extraction → LightGBM classification. Key innovations were token-retrieval blocking (vs exact-hash) for +10% recall, vectorized feature computation for 10x speed, and a two-threshold strategy for precision on singletons. Trained on 100k holdout with early stopping, achieved F0.5 ~0.85. Future work: learned embeddings, ensemble models, and active learning."
+
+Does this make sense? Want me to dive deeper into any specific part? 🚀
+
+result: Complete breakdown of entity resolution pipeline (normalization → BM25 blocking → feature engineering → LightGBM) with architecture decisions, optimization history, and production-readiness gaps documented.
+
+✻ Sautéed for 1m 45s · done 12:39 PM
+
+❯ list all the WHAT COULD HAVEE BEEN DONE BETTER
+
+  Thought for 3s
+
+WHAT COULD HAVE BEEN DONE BETTER
+
+1. ARCHITECTURE & APPROACH
+
+No Learned Blocking
+
+- Current: BM25 returns top 150 candidates by token overlap
+- Better: Train a lightweight binary classifier on cheap features (exact matches, token overlap counts) to filter candidates before expensive LightGBM scoring
+- Why: Reduces false positives earlier in the pipeline, saves computation
+
+No Ensemble Models
+
+- Current: Single LightGBM model
+- Better: Train multiple models (LightGBM + XGBoost + CatBoost + Logistic Regression) and average/stack their predictions
+- Why: Reduces overfitting, more robust to edge cases
+
+No Negative Sampling Strategy
+
+- Current: Uses all 150 candidates (149 negatives, 1 positive) → extreme class imbalance
+- Better: Hard negative mining - sample negatives with high blocking scores but not ground-truth matches
+- Why: Model learns to discriminate hard cases, not just obvious ones
+
+No Cross-Validation
+
+- Current: Single 70/30 train/val split
+- Better: 5-fold stratified cross-validation
+- Why: More robust threshold tuning, catches overfitting
+
+No Hyperparameter Tuning
+
+- Current: Hardcoded LightGBM params (num_leaves=63, learning_rate=0.05)
+- Better: Optuna/GridSearchCV for hyperparameter optimization
+- Why: Current params might be suboptimal
+
+---
+
+2. FEATURE ENGINEERING
+
+Missing Edit Distance Features
+
+- Missing: Levenshtein/Damerau-Levenshtein distance
+- Why important: Classic ER feature, catches single-character edits ("McDonald" vs "MacDonald")
+- Example: edit_distance("Gulf", "Gúlf") = 1 (typo detection)
+
+No Learned Embeddings
+
+- Missing: Sentence-BERT/FastText embeddings → cosine similarity
+- Why important: Captures semantic similarity ("Restaurant" ≈ "Eatery")
+- Example: embedding_sim("McDonald's Restaurant", "McDonald Eatery") = 0.92
+
+No Interaction Features
+
+- Missing: Cross-products like name_match * addr_match, rare_name * high_jaro_winkler
+- Why important: Non-linear relationships matter (rare name + high similarity = strong signal)
+- Example: name_rare AND jaro_winkler > 0.9 → very high confidence
+
+No Contextual Features
+
+- Missing:
+  - Industry/sector signals (extracted from name tokens like "restaurant", "hospital")
+  - Geographic proximity (lat/lon distance if available)
+  - Temporal features (founding year if in data)
+- Why important: Structural information aids disambiguation
+
+Phonetic Matching Too Basic
+
+- Current: Only Soundex (designed for English surnames)
+- Better: Metaphone, Double Metaphone, or NYSIIS
+- Why: Better for business names, especially non-English
+- Example: soundex("Restaurant") = R236, metaphone("Restaurant") = RSTRNT (more precise)
+
+No Abbreviation Handling
+
+- Missing: "International" ↔ "Intl", "Corporation" ↔ "Corp"
+- Current: Strips suffixes entirely, but doesn't match mid-word abbreviations
+- Better: Abbreviation dictionary for common business terms
+
+No Character-Level Features
+
+- Missing:
+  - Longest common substring length
+  - Prefix/suffix overlap beyond Jaro-Winkler
+  - All-caps vs mixed-case (formatting signals)
+
+No Frequency-Based Disambiguation
+
+- Current: name_rare is binary (count < 4)
+- Better: TF-IDF per token across the entire corpus, then weighted sum
+- Example: "Starbucks" should have much higher IDF than "Coffee Shop"
+
+---
+
+3. BLOCKING IMPROVEMENTS
+
+Fixed Candidate Cap
+
+- Current: CAP=150 is hardcoded
+- Better: Adaptive cap based on blocking score distribution
+- Example: If top candidate has score 50 and 2nd has score 5, only consider top 10
+
+No Country-Specific Blocking
+
+- Current: Same blocking strategy for all countries
+- Better: US companies might need street-number emphasis, Indian companies need locality tokens
+- Example: India uses "Nagar", "Colony", "Marg" more - weight these higher
+
+No Multipass Blocking
+
+- Current: Single BM25 pass
+- Better:
+  a. Pass 1: Exact name + city
+  b. Pass 2: Phonetic name + house number
+  c. Pass 3: BM25 fallback
+- Why: Captures different match types, union of results
+
+MAX_POSTING Too Aggressive
+
+- Current: Skips tokens with >2000 postings
+- Better: Use these tokens but with heavy IDF penalty, or bloom filter for quick rejection
+- Why: Completely ignoring common tokens might miss valid matches in rare contexts
+
+---
+
+4. NORMALIZATION
+
+Fixed Stopword Lists
+
+- Current: Hardcoded SUFFIXES, NOISE_WORDS, ADDR_STOP for US/India/France
+- Better: Build stopword lists from data (extract top N most frequent tokens per country)
+- Why: Brittle when new countries appear, misses domain-specific noise
+
+No Spelling Correction
+
+- Missing: Handle common typos ("Resturant" → "Restaurant")
+- Better: Train a character-level model or use symspell
+- Why: Real data has typos, especially in user-generated content
+
+No Transliteration Handling
+
+- Missing: Hindi/Tamil names romanized differently ("Mumbai" vs "Bombay")
+- Current: Only handles city aliases in REGION dict
+- Better: Phonetic transliteration equivalence classes
+
+Domain Removal Too Aggressive
+
+- Current: Removes .com, .in, .fr entirely
+- Better: Keep domain as a separate feature (domain match = strong signal)
+- Example: "example.com" in both name fields → exact match indicator
+
+---
+
+5. THRESHOLD TUNING
+
+Coarse Threshold Search
+
+- Current: Search in 2% steps (0.05, 0.07, 0.09, ...)
+- Better: Binary search or golden-section search for finer granularity
+- Example: Optimal might be 0.473, but you'd pick 0.47
+
+No Class-Weighted Threshold
+
+- Current: Same threshold for all predictions
+- Better: Different thresholds for rare vs common names
+- Example: Rare names might need lower threshold (less training data)
+
+Two-Threshold Search Too Narrow
+
+- Current: singleton_t = match_t + [0.02, 0.15]
+- Better: Independent grid search for both thresholds
+- Why: Assumes singleton_t > match_t, but optimal might be lower in edge cases
+
+---
+
+6. CODE QUALITY
+
+Globals for Multiprocessing
+
+# Current (lines 113-119):
+_W_S1 = _W_INDEX = _W_IDF = None  # Ugly globals
+
+# Better:
+from functools import partial
+worker_fn = partial(_featurize_entity, s1=s1, index=index, idf=idf)
+pool.imap(worker_fn, holdout)
+
+No Logging Framework
+
+# Current:
+print(f"Loaded {len(s1)} entities", flush=True)
+
+# Better:
+import logging
+logger.info(f"Loaded {len(s1)} entities")
+
+No Configuration Management
+
+# Current: Hardcoded everywhere
+CAP = 150
+HOLDOUT_N = 100_000
+NUM_FEATURES = 17
+
+# Better:
+# config.yaml
+blocking:
+  cap: 150
+  max_posting: 2000
+training:
+  holdout_size: 100000
+  train_split: 0.7
+
+No Type Hints
+
+# Current:
+def candidates_for(index, name, addr, country, idf):
+
+# Better:
+def candidates_for(
+    index: dict[tuple, list[str]],
+    name: str,
+    addr: str,
+    country: str,
+    idf: dict[str, float] | None = None
+) -> tuple[list[str], bool]:
+
+No Unit Tests
+
+- Missing: Tests for normalization, feature computation, blocking
+- Example: Test that name_tokens("McDonald's LLC") == ["mcdonald"]
+
+No Docstring Standardization
+
+- Current: Mix of numpy-style and informal docstrings
+- Better: Pick one format (Google/numpy/Sphinx) and stick to it
+
+Hardcoded Paths
+
+# Current (line 31):
+MODEL_LGB = HERE / "src/model.lgb"
+
+# Better:
+MODEL_DIR = Path(os.getenv("MODEL_DIR", HERE / "models"))
+
+---
+
+7. EVALUATION & MONITORING
+
+No Ablation Study
+
+- Missing: Test dropping each feature to see impact
+- Example: Does phonetic_match actually help? Remove it and re-train
+
+No Error Analysis
+
+- Missing: Inspect false positives/negatives to find patterns
+- Example: Are all FPs in a specific country? Do FNs have low blocking scores?
+
+No Stratified Sampling
+
+- Current: Random 70/30 split
+- Better: Stratify by country, name frequency, candidate count
+- Why: Ensures validation set is representative
+
+No Confidence Calibration
+
+- Current: Raw LightGBM probabilities used
+- Better: Platt scaling or isotonic regression to calibrate probabilities
+- Why: P(match) should reflect true probability (important for threshold tuning)
+
+No Online Metrics
+
+- Missing: If deployed, track precision/recall drift over time
+- Better: Log predictions, sample for human review, A/B test threshold changes
+
+No Feature Importance Analysis
+
+- Missing: Which features drive predictions?
+- Better: SHAP values or LightGBM's feature_importances_
+- Why: Helps debug, validate domain assumptions
+
+---
+
+8. PERFORMANCE OPTIMIZATIONS (Still Possible)
+
+Phonetic & Rarity Features Not Vectorized
+
+# Current (lines 139-148 in fast_features.py): Loops in Python
+for i in range(n):
+    if c_nsq[i]:
+        X[i, 15] = 1.0 if _jf.soundex(c_nsq[i]) == s1_sdx else 0.0
+
+# Better: Pre-compute soundex for all candidates
+c_sdx = [_jf.soundex(nm) for nm in c_nsq]
+X[:, 15] = np.array([1.0 if s == s1_sdx else 0.0 for s in c_sdx])
+
+No GPU Acceleration
+
+- Current: CPU-only LightGBM
+- Better: LightGBM with device='gpu' for large-scale training
+- Why: 5-10x speedup on large datasets
+
+No Feature Caching
+
+- Current: Re-computes features every run
+- Better: Cache features to disk (Parquet/Feather), only recompute on schema change
+- Why: Faster experimentation (train/val split changes don't require re-featurization)
+
+No Blocking Index Serialization
+
+- Current: Re-builds BM25 index every run
+- Better: Pickle or joblib.dump the index
+- Why: Index building takes ~10-20% of runtime
+
+---
+
+9. DATA QUALITY
+
+No Deduplication Check
+
+- Missing: Are there exact duplicates in Source 1?
+- Better: Pre-dedupe before training
+- Why: Model might learn noise if duplicates exist
+
+No Outlier Detection
+
+- Missing: Flag records with extremely long names (>100 chars), suspicious characters
+- Better: Log these for manual review
+- Example: "!!!BEST DEAL!!! www.scam.com" is probably not a real business
+
+No Encoding Validation
+
+- Current: Strips \ufffd (replacement character)
+- Better: Log files with encoding issues, try to recover original text
+- Why: Data loss might harm recall
+
+---
+
+10. MODEL DEPLOYMENT
+
+No Model Versioning
+
+- Current: Overwrites model.json every run
+- Better: MLflow/DVC for model registry with version tags
+- Example: models/lgbm_v1.2_f05_0.8543.pkl
+
+No Inference API
+
+- Missing: REST API for real-time matching
+- Better: FastAPI endpoint with batching support
+@app.post("/match")
+def match_entity(entity: Entity) -> List[Match]:
+    candidates = blocking(entity)
+    scores = model.predict(candidates)
+    return top_k(scores, threshold)
+
+No Fallback Strategy
+
+- Current: If LightGBM fails to load, crashes
+- Better: Fallback to rule-based matcher (e.g., only exact name+address)
+
+No Monitoring/Logging
+
+- Missing: Track inference latency, candidate counts, match rates
+- Better: Prometheus metrics, Grafana dashboards
+
+---
+
+SUMMARY TABLE
+
+┌───────────────┬─────────────────────────────────────┬──────────────────────────────────────┐
+│   Category    │               Issues                │                Impact                │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────────────┤
+│ Architecture  │ No ensemble, no learned blocking    │ 🔴 High - limits F0.5 ceiling        │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────────────┤
+│ Features      │ Missing embeddings, edit distance   │ 🔴 High - lower recall               │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────────────┤
+│ Blocking      │ Fixed CAP, no multipass             │ 🟡 Medium - misses some candidates   │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────────────┤
+│ Normalization │ Hardcoded stopwords, no spell-check │ 🟡 Medium - brittle to new data      │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────────────┤
+│ Thresholds    │ Coarse search, no per-class tuning  │ 🟡 Medium - suboptimal cutoff        │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────────────┤
+│ Code Quality  │ Globals, no tests, no config        │ 🟢 Low - works but unmaintainable    │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────────────┤
+│ Evaluation    │ No ablation, no error analysis      │ 🟢 Low - harder to debug             │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────────────┤
+│ Performance   │ Some loops, no caching              │ 🟢 Low - fast enough for now         │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────────────┤
+│ Deployment    │ No API, no versioning               │ 🟢 Low - competition, not production │
+└───────────────┴─────────────────────────────────────┴──────────────────────────────────────┘
+
+---
+
+TOTAL: 45+ improvements identified
+
+Want me to deep-dive into implementing any specific fix? (e.g., "show me how to add edit distance features" or "write the ensemble model code")
+
+✻ Cooked for 1m 12s · done 12:43 PM
+
+※ recap: I just gave you a complete breakdown of your entity resolution pipeline: normalization, BM25 blocking, 17 feature extraction, and LightGBM classification with two threshold optimization. Listed 45+ improvements across architecture, features, code quality, and deployment. Pick any area you want to dive deeper into or implement. (disable recaps in /config)
+
+❯ NOW COMPARE THESE WITH THE RESEARCH ARTIFACTS IN /Users/reshmaaffrin/Downloads/golden-retriever/.claude/worktrees
+
+  Thought for 2s
+
+Let me explore the research artifacts in your worktrees to see what was actually investigated:
+
+  Thought for 16s, searched for 2 patterns, read 9 files, listed 2 directories
+
+Now let me create a comprehensive comparison for you:
+
+⏺ Write(~/.claude/jobs/6c6488e3/tmp/research_vs_implementation_gap_analysis.md)
+Wrote 326 lines to ../../.claude/jobs/6c6488e3/tmp/research_vs_implementation_gap_analysis.md
+# Research vs Implementation: Gap Analysis
+## Amazon ML Challenge 2026 - Entity Resolution Pipeline
+
+**Generated:** 2026-09-26
+**Purpose:** Compare what was researched vs what was implemented vs what I identified as "could have been better"
+
+---
+
+## EXECUTIVE SUMMARY
+… +316 lines
+
+  Thought for 2s
+
+Perfect! Now let me create a visual summary for you:
+
+⏺ Write(~/.claude/jobs/6c6488e3/tmp/comparison_summary.md)
+Wrote 322 lines to ../../.claude/jobs/6c6488e3/tmp/comparison_summary.md
+# 🎯 Research vs Implementation: Quick Summary
+
+## The Big Picture
+
+```
+┌─────────────────────────────────────────────────────┐
+│  MY "COULD BE BETTER" ANALYSIS (45 suggestions)     │
+│                                                       │
+│  ✅ Already Researched: 32 items (70%)               │
+│  🟡 Research Gap:       11 items (25%)               │
+… +312 lines
+
+  Thought for 2s
+
+🎓 Learning Summary: What You Did Right & Where The Gap Is
+
+THE VERDICT
+
+Your research was BETTER than my "what could be better" analysis:
+- ✅ 70% of my 45 suggestions were already in your 19 research docs
+- ✅ You covered things I missed (graph methods, active learning, LLMs, multilingual)
+- ✅ 330 pages of research with code examples and effort estimates
+- ✅ Production-ready ditto_scorer.py (330 lines) written
+
+But only 6% got deployed:
+- ✅ Two-threshold optimization: IMPLEMENTED ✓
+- ⚠️  Ditto scorer: CODE WRITTEN but not integrated
+- ❌ Everything else: 30 researched improvements sitting unused
+
+---
+
+HEAD-TO-HEAD COMPARISON
+
+┌────────────────────┬───────────────────────────┬────────────────────────────────────────────────┬──────────────┐
+│      Category      │        My Analysis        │                 Your Research                  │   Gap Type   │
+├────────────────────┼───────────────────────────┼────────────────────────────────────────────────┼──────────────┤
+│ Ensemble models    │ "Should do this"          │ 25-page doc + 3 strategies                     │ DEPLOYMENT   │
+├────────────────────┼───────────────────────────┼────────────────────────────────────────────────┼──────────────┤
+│ Learned embeddings │ "Add Sentence-BERT"       │ "Use BAAI/bge-m3, here's the model card"       │ DEPLOYMENT   │
+├────────────────────┼───────────────────────────┼────────────────────────────────────────────────┼──────────────┤
+│ Cross-encoder      │ "Could try Ditto"         │ 16-page deep dive + 330-line scorer            │ INTEGRATION  │
+├────────────────────┼───────────────────────────┼────────────────────────────────────────────────┼──────────────┤
+│ MinHash blocking   │ Didn't mention            │ Full code example + threshold tuning           │ DEPLOYMENT   │
+├────────────────────┼───────────────────────────┼────────────────────────────────────────────────┼──────────────┤
+│ Graph features     │ "Too complex"             │ 13-page doc with algorithms                    │ DEPLOYMENT   │
+├────────────────────┼───────────────────────────┼────────────────────────────────────────────────┼──────────────┤
+│ Multilingual       │ Mentioned briefly         │ 12-page doc: "France is 15%, use these models" │ DEPLOYMENT   │
+├────────────────────┼───────────────────────────┼────────────────────────────────────────────────┼──────────────┤
+│ Code quality       │ 5 suggestions             │ Not covered                                    │ RESEARCH GAP │
+├────────────────────┼───────────────────────────┼────────────────────────────────────────────────┼──────────────┤
+│ Deployment         │ Monitoring/API/versioning │ Not covered                                    │ RESEARCH GAP │
+└────────────────────┴───────────────────────────┴────────────────────────────────────────────────┴──────────────┘
+
+Score: Research > My Analysis (8-2 wins, 15 ties)
+
+---
+
+THE BIG SURPRISES
+
+What Research Found That I Missed:
+
+1. Active learning - human-in-loop for 72h contest is viable
+2. Graph-based transitive closure - I thought too complex, but research shows +0.01-0.02 F0.5 for 3h work
+3. Data augmentation - paraphrase generation to handle singleton imbalance
+4. LLM zero-shot - GPT-4 as tiebreaker for uncertain pairs ($2-5 for 1000 pairs)
+5. Multilingual embeddings - specific model recommendations for French support
+
+What I Found That Research Missed:
+
+1. Code quality (globals, logging, config) - research focused on algorithms
+2. Deployment strategy (API, versioning, monitoring) - co
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────── code explanation walkthrough ─
+❯
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
