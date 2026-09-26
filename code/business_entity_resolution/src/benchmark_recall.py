@@ -20,6 +20,7 @@ Decision rule:
 """
 from __future__ import annotations
 
+import os
 import random
 import sys
 import time
@@ -89,19 +90,52 @@ def benchmark_bm25(s1, gt, holdout, pool, idf, cap=200):
     return rec, mean_c, elapsed, cands_list
 
 
+def _bm25_worker(args):
+    sid, name, addr, country, cap = args
+    _blk.CAP = cap
+    cands, _ = candidates_for(_W_INDEX, name, addr, country, _W_IDF)
+    return sid, cands
+
+
+_W_INDEX = None
+_W_IDF = None
+
+
+def _init_bm25_worker(index, idf):
+    global _W_INDEX, _W_IDF
+    _W_INDEX = index
+    _W_IDF = idf
+
+
 def benchmark_bm25_proper(s1, gt, holdout, pool, bm25_index, idf, cap=200):
+    import multiprocessing as mp
+
     _blk.CAP = cap
     t0 = time.time()
-    cands_list, gold_list = [], []
-    for sid in holdout:
-        _name, _addr, country, _ = s1[sid]
-        cands, _ = candidates_for(bm25_index, _name, _addr, country, idf)
-        cands_list.append(cands)
-        gold_list.append(gt.get(sid, set()) & set(pool.keys()))
+    n_workers = max(1, os.cpu_count() or 4)
+    print(f"  Parallel BM25 lookup across {n_workers} CPU workers...", flush=True)
+
+    args_list = [
+        (sid, s1[sid][0], s1[sid][1], s1[sid][2], cap)
+        for sid in holdout
+    ]
+
+    cands_dict = {}
+    done_count = 0
+    with mp.Pool(processes=n_workers, initializer=_init_bm25_worker, initargs=(bm25_index, idf)) as p:
+        for sid, cands in p.imap_unordered(_bm25_worker, args_list, chunksize=500):
+            cands_dict[sid] = cands
+            done_count += 1
+            if done_count % 20000 == 0:
+                print(f"  BM25: {done_count:,}/{len(holdout):,} queried ({time.time()-t0:.0f}s)", flush=True)
+
+    cands_list = [cands_dict[sid] for sid in holdout]
+    gold_list = [gt.get(sid, set()) & set(pool.keys()) for sid in holdout]
     elapsed = time.time() - t0
     rec = recall_at_k(cands_list, gold_list, [k for k in KS if k <= cap])
     mean_c = sum(len(c) for c in cands_list) / len(cands_list)
     return rec, mean_c, elapsed, cands_list
+
 
 
 def benchmark_dense(s1, gt, holdout, pool, faiss_index, pool_eids, top_k=500):
