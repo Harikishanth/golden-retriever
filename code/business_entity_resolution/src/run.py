@@ -21,8 +21,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from blocking import build_index_and_idf, candidates_for  # noqa: E402
 from evaluate import f05_one, fmt, summarize  # noqa: E402
 from io_utils import ROOT, iter_ground_truth, iter_source, write_submission  # noqa: E402
-from match import FEATURE_NAMES, features, name_freq, precompute  # noqa: E402
-from fast_features import batch_features  # noqa: E402
+from match import FEATURE_NAMES, features, name_freq, precompute  # noqa: E402  (features/precompute kept for fallback)
+from fast_features import batch_features, NUM_FEATURES  # noqa: E402
 
 HERE = Path(__file__).resolve().parents[1]
 HOLDOUT_N = 100_000
@@ -55,14 +55,20 @@ def load_pool(paths):
 
 def _clf_scores(clf, X: np.ndarray) -> np.ndarray:
     """Return 1-D probability array for positive class."""
-    try:
+    # LGBMClassifier (during holdout training) — must be before Booster check
+    # because LGBMClassifier.predict() returns class labels, not probabilities
+    if hasattr(clf, "predict_proba"):
         return clf.predict_proba(X)[:, 1].astype(np.float32)
-    except AttributeError:
-        # LR stored as linear weights in model.json — handled via score()
-        w = np.array(clf["coef"], dtype=np.float32)
-        b = np.float32(clf["intercept"])
-        raw = X @ w + b
-        return (1.0 / (1.0 + np.exp(-raw))).astype(np.float32)
+    # LightGBM Booster (loaded from file at test time) — predict() returns probs
+    # for binary classification objective
+    if hasattr(clf, "predict") and callable(clf.predict):
+        raw = clf.predict(X)
+        return np.asarray(raw, dtype=np.float32)
+    # LR stored as linear weights in model.json
+    w = np.array(clf["coef"], dtype=np.float32)
+    b = np.float32(clf["intercept"])
+    raw = X @ w + b
+    return (1.0 / (1.0 + np.exp(-raw))).astype(np.float32)
 
 
 def save_model_lgbm(clf, threshold: float):
@@ -118,18 +124,21 @@ def run_holdout():
     pool = load_pool(pool_paths)
     print(f"Pool: {len(pool):,} ({time.time()-t0:.0f}s)", flush=True)
 
-    # ── Phase 1: featurize ────────────────────────────────────────────
+    # ── Phase 1: featurize (batch mode for speed) ─────────────────────
     entity_data = []
     total_pairs = 0
     for i, sid in enumerate(holdout):
         _name, _addr, country, s1f = s1[sid]
         cands, was_capped = candidates_for(index, _name, _addr, country, idf)
         gold = gt.get(sid, set())
-        scored = []
-        for c in cands:
-            cname, caddr, _ = pool[c]
-            candf = precompute(cname, caddr)
-            scored.append((c, features(s1f, country, candf, idf, freq)))
+        if cands:
+            cand_names = [pool[c][0] for c in cands]
+            cand_addrs = [pool[c][1] for c in cands]
+            X_ent = batch_features(_name, _addr, country,
+                                   cand_names, cand_addrs, idf, freq)
+            scored = [(cands[j], X_ent[j].tolist()) for j in range(len(cands))]
+        else:
+            scored = []
         entity_data.append((sid, scored, gold, set(cands), was_capped))
         total_pairs += len(scored)
         if (i + 1) % 20000 == 0:

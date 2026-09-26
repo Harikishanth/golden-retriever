@@ -5,6 +5,7 @@ Replaces the Python for-loop in run.py with batch operations.
 """
 from __future__ import annotations
 
+import math
 import numpy as np
 
 try:
@@ -13,7 +14,15 @@ try:
 except ImportError:
     _HAS_RAPIDFUZZ = False
 
+try:
+    import jellyfish as _jf
+    _HAS_JELLYFISH = True
+except ImportError:
+    _HAS_JELLYFISH = False
+
 from normalize import addr_tokens, fold, house_numbers, name_tokens
+
+NUM_FEATURES = 17
 
 
 def batch_features(s1_name: str, s1_addr: str, s1_country: str,
@@ -21,11 +30,11 @@ def batch_features(s1_name: str, s1_addr: str, s1_country: str,
                    idf: dict, freq: dict) -> np.ndarray:
     """Compute feature matrix for one S1 entity vs all its candidates.
 
-    Returns: float32 array of shape (len(cands), 15)
+    Returns: float32 array of shape (len(cands), NUM_FEATURES)
     """
     n = len(cand_names)
     if n == 0:
-        return np.zeros((0, 15), dtype=np.float32)
+        return np.zeros((0, NUM_FEATURES), dtype=np.float32)
 
     # Precompute S1
     s1_ntoks = name_tokens(s1_name)
@@ -50,7 +59,7 @@ def batch_features(s1_name: str, s1_addr: str, s1_country: str,
     c_city = [t[-1] if t else "" for t in c_atoks]
     c_fn = [fold(nm).strip() for nm in cand_names]
 
-    X = np.zeros((n, 15), dtype=np.float32)
+    X = np.zeros((n, NUM_FEATURES), dtype=np.float32)
 
     for i in range(n):
         t2 = c_nset[i]
@@ -124,5 +133,17 @@ def batch_features(s1_name: str, s1_addr: str, s1_country: str,
         # rf_addr_sort
         as_scores = _rfp.cdist([s1_asq], c_asq, scorer=_fuzz.token_sort_ratio, score_cutoff=0)
         X[:, 14] = as_scores[0] / 100.0
+
+    # phonetic_match (feature 15)
+    if _HAS_JELLYFISH and s1_nsq:
+        s1_sdx = _jf.soundex(s1_nsq)
+        for i in range(n):
+            if c_nsq[i]:
+                X[i, 15] = 1.0 if _jf.soundex(c_nsq[i]) == s1_sdx else 0.0
+
+    # name_rarity_log (feature 16) — continuous version of name_rare
+    f = freq.get((c, s1_nsq), 1)
+    rarity_val = math.log(1.0 / max(f, 1) + 1.0)
+    X[:, 16] = rarity_val
 
     return X
