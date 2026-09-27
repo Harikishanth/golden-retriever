@@ -318,8 +318,9 @@ def train_cross_encoder(pairs, labels, val_pairs, val_labels, cfg: Cfg):
         from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
         from datasets import Dataset
 
-        model = CrossEncoder(cfg.ce_model, max_length=cfg.ce_maxlen,
-                             device=_device())
+        device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
+        model = CrossEncoder(cfg.ce_model, max_length=cfg.ce_maxlen, device=device_str)
+
         train_ds = Dataset.from_dict({
             "sentence1": [p[0] for p in pairs],
             "sentence2": [p[1] for p in pairs],
@@ -331,15 +332,16 @@ def train_cross_encoder(pairs, labels, val_pairs, val_labels, cfg: Cfg):
             "label": val_labels,
         }) if val_pairs else None
 
+        _dev = next(model.model.parameters()).device
         loss = BinaryCrossEntropyLoss(model=model,
-                                      pos_weight=torch.tensor(cfg.ce_pos_weight))
+                                      pos_weight=torch.tensor(cfg.ce_pos_weight, device=_dev))
         outdir = str(CKPT / "ce-mdeberta")
         args = CrossEncoderTrainingArguments(
             output_dir=outdir,
             num_train_epochs=cfg.ce_epochs,
             per_device_train_batch_size=cfg.ce_batch,
             learning_rate=cfg.ce_lr,
-            warmup_ratio=0.1,
+            warmup_steps=0.1,
             weight_decay=0.01,
             fp16=torch.cuda.is_available(),
             logging_steps=200,
@@ -351,32 +353,50 @@ def train_cross_encoder(pairs, labels, val_pairs, val_labels, cfg: Cfg):
         trainer = CrossEncoderTrainer(model=model, args=args,
                                       train_dataset=train_ds,
                                       eval_dataset=eval_ds, loss=loss)
+        # Prevent DataParallel wrapping attribute error in sentence-transformers
+        if hasattr(trainer.model, "device") is False and hasattr(trainer.model, "module"):
+            trainer.model.device = next(trainer.model.module.parameters()).device
         trainer.train()
         model.save_pretrained(outdir)
         print(f"Cross-encoder saved → {outdir}", flush=True)
         return model
-    except ImportError as e:
-        print(f"CrossEncoderTrainer unavailable ({e}), falling back", flush=True)
+    except (ImportError, Exception) as e:
+        print(f"CrossEncoderTrainer failed ({e}), falling back to manual", flush=True)
         return _train_ce_manual(pairs, labels, cfg)
 
 
 def _train_ce_manual(pairs, labels, cfg: Cfg):
     import torch
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    from torch.utils.data import DataLoader, TensorDataset
+    from torch.utils.data import DataLoader, Dataset
     from torch.optim import AdamW
+
+    class OnTheFlyDataset(Dataset):
+        def __init__(self, pairs, labels, tokenizer, max_len):
+            self.pairs = pairs
+            self.labels = labels
+            self.tokenizer = tokenizer
+            self.max_len = max_len
+
+        def __len__(self):
+            return len(self.pairs)
+
+        def __getitem__(self, idx):
+            p1, p2 = self.pairs[idx]
+            enc = self.tokenizer(p1, p2, truncation=True, max_length=self.max_len,
+                                 padding="max_length", return_tensors="pt")
+            return {
+                "input_ids": enc["input_ids"].squeeze(0),
+                "attention_mask": enc["attention_mask"].squeeze(0),
+                "labels": torch.tensor(self.labels[idx], dtype=torch.long)
+            }
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.ce_model)
     model = AutoModelForSequenceClassification.from_pretrained(
         cfg.ce_model, num_labels=2)
-    texts_a = [p[0] for p in pairs]
-    texts_b = [p[1] for p in pairs]
-    enc = tokenizer(texts_a, texts_b, truncation=True, padding=True,
-                    max_length=cfg.ce_maxlen, return_tensors="pt")
-    ds = TensorDataset(enc["input_ids"], enc["attention_mask"],
-                       torch.tensor(labels, dtype=torch.long))
+    ds = OnTheFlyDataset(pairs, labels, tokenizer, cfg.ce_maxlen)
     loader = DataLoader(ds, batch_size=cfg.ce_batch * cfg.ce_grad_accum,
-                        shuffle=True)
+                        shuffle=True, num_workers=4)
     device = torch.device(_device())
     model.to(device)
     if device.type == "cuda":
@@ -386,13 +406,18 @@ def _train_ce_manual(pairs, labels, cfg: Cfg):
     for epoch in range(cfg.ce_epochs):
         total_loss, n_batch = 0, 0
         for batch in loader:
-            ids, mask, lbl = [b.to(device) for b in batch]
+            ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            lbl = batch["labels"].to(device)
             out = model(input_ids=ids, attention_mask=mask, labels=lbl)
             out.loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             total_loss += out.loss.item()
             n_batch += 1
+            if n_batch % 500 == 0:
+                print(f"  CE epoch {epoch+1}/{cfg.ce_epochs} batch {n_batch}/{len(loader)} "
+                      f"loss={total_loss/n_batch:.4f}", flush=True)
         print(f"  CE epoch {epoch+1}/{cfg.ce_epochs}  "
               f"loss={total_loss/max(n_batch,1):.4f}", flush=True)
     outdir = str(CKPT / "ce-mdeberta")
