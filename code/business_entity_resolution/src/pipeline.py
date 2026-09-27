@@ -28,6 +28,7 @@ import pickle
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -67,7 +68,7 @@ class Cfg:
     # Dense retrieval
     dense_model: str = "Qwen/Qwen3-Embedding-0.6B"
     dense_dim: int = 512          # True Matryoshka — 512-dim works correctly
-    dense_batch: int = 256
+    dense_batch: int = 512
     dense_top_k: int = 200
     dense_fp16_index: bool = True
 
@@ -969,6 +970,35 @@ def run_test(cfg: Cfg):
     cands_out: dict[str, list[str]] = {}
     scores_dict_graph: dict[tuple, float] = {}
     n_ce_total = 0
+    _N_FEAT_WORKERS = min(32, (os.cpu_count() or 8))
+    print(f"Test inference using {_N_FEAT_WORKERS} parallel featurization threads", flush=True)
+
+    def _featurize_entity(sid):
+        """Pure CPU: BM25 retrieval + feature extraction for one entity.
+        Thread-safe: reads only shared immutable dicts (pool, index, idf, freq).
+        Returns (sid, hybrid, X_ent) or (sid, [], None) for empty."""
+        s1_name, s1_addr, country, _ = s1[sid]
+        bm25_c, _ = candidates_for(index, s1_name, s1_addr, country, idf)
+        dense_c = _batch_dense_cands_ref[0].get(sid, [])
+        cos_dict = _batch_cosines_ref[0].get(sid, {})
+        seen: set[str] = set()
+        hybrid: list[str] = []
+        for c in bm25_c + dense_c:
+            if c not in seen and c in pool:
+                seen.add(c)
+                hybrid.append(c)
+        if not hybrid:
+            return sid, [], None
+        cand_names = [pool[c][0] for c in hybrid]
+        cand_addrs = [pool[c][1] for c in hybrid]
+        X_ent = extended_features(
+            s1_name, s1_addr, country, cand_names, cand_addrs,
+            idf, freq, cos_dict, hybrid)
+        return sid, hybrid, X_ent
+
+    # Mutable reference boxes so the closure can be updated each batch
+    _batch_dense_cands_ref = [{}]
+    _batch_cosines_ref = [{}]
 
     for batch_start in range(0, len(order), cfg.test_batch):
         batch = order[batch_start:batch_start + cfg.test_batch]
@@ -978,29 +1008,27 @@ def run_test(cfg: Cfg):
         batch_dense_cands, batch_cosines = dense.search(
             batch_records, top_k=cfg.dense_top_k)
 
-        for sid in batch:
-            s1_name, s1_addr, country, _ = s1[sid]
-            bm25_c, _ = candidates_for(index, s1_name, s1_addr, country, idf)
-            dense_c = batch_dense_cands.get(sid, [])
-            cos_dict = batch_cosines.get(sid, {})
+        # Update the closure-visible references
+        _batch_dense_cands_ref[0] = batch_dense_cands
+        _batch_cosines_ref[0] = batch_cosines
 
-            seen: set[str] = set()
-            hybrid: list[str] = []
-            for c in bm25_c + dense_c:
-                if c not in seen and c in pool:
-                    seen.add(c)
-                    hybrid.append(c)
+        # Parallel featurization across all entities in the batch
+        feat_results = {}
+        with ThreadPoolExecutor(max_workers=_N_FEAT_WORKERS) as ex:
+            futs = {ex.submit(_featurize_entity, sid): sid for sid in batch}
+            for fut in as_completed(futs):
+                sid, hybrid, X_ent = fut.result()
+                feat_results[sid] = (hybrid, X_ent)
+
+        # Sequential scoring (LightGBM + iso + CE) — not thread-safe to parallelize
+        for sid in batch:
+            hybrid, X_ent = feat_results[sid]
+            s1_name, s1_addr, country, _ = s1[sid]
             cands_out[sid] = hybrid
 
-            if not hybrid:
+            if X_ent is None:
                 matches[sid] = []
                 continue
-
-            cand_names = [pool[c][0] for c in hybrid]
-            cand_addrs = [pool[c][1] for c in hybrid]
-            X_ent = extended_features(
-                s1_name, s1_addr, country, cand_names, cand_addrs,
-                idf, freq, cos_dict, hybrid)
 
             # LightGBM → calibrated with iso
             lgbm_s = lgbm_clf.predict(X_ent).astype(np.float32)
