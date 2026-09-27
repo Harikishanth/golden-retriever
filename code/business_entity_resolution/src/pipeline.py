@@ -109,7 +109,7 @@ class Cfg:
     graph_max_component: int = 15
 
     # Inference
-    test_batch: int = 5_000
+    test_batch: int = 50_000
     dense_search_chunk: int = 50_000  # S1 entities per dense-search chunk
 
     def to_json(self) -> str:
