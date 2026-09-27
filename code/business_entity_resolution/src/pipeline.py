@@ -697,10 +697,11 @@ def run_holdout(cfg: Cfg):
 
     # ── Hybrid blocking ───────────────────────────────────────────
     print(f"\n--- Hybrid blocking (BM25 ∪ dense) ---", flush=True)
-    entity_data = []
-    total_pairs = 0
+    _N_WORKERS = min(32, (os.cpu_count() or 8))
+    print(f"Parallel featurization using {_N_WORKERS} threads...", flush=True)
 
-    for i, sid in enumerate(holdout):
+    def _featurize_holdout_ent(item):
+        i, sid = item
         _name, _addr, country, s1f = s1[sid]
         bm25_c, _ = candidates_for(index, _name, _addr, country, idf)
         dense_c = dense_cands.get(sid, [])
@@ -722,16 +723,22 @@ def run_holdout(cfg: Cfg):
             scored = [(hybrid[j], X_ent[j].tolist()) for j in range(len(hybrid))]
         else:
             scored = []
+        return i, (sid, scored, gold, set(hybrid), False, country), len(scored), sid
 
-        entity_data.append((sid, scored, gold, set(hybrid), False, country))
-        total_pairs += len(scored)
+    entity_data = [None] * len(holdout)
+    total_pairs = 0
+    items = list(enumerate(holdout))
 
-        # Free per-entity cosine data as we go to save RAM
-        cosine_scores.pop(sid, None)
-
-        if (i + 1) % 20000 == 0:
-            print(f"  {i+1:,} entities  {total_pairs:,} pairs  "
-                  f"({_timer()-t0:.0f}s)", flush=True)
+    with ThreadPoolExecutor(max_workers=_N_WORKERS) as executor:
+        futures = {executor.submit(_featurize_holdout_ent, item): item[0] for item in items}
+        for count, future in enumerate(as_completed(futures), 1):
+            i, res_tuple, n_pairs, sid = future.result()
+            entity_data[i] = res_tuple
+            total_pairs += n_pairs
+            cosine_scores.pop(sid, None)
+            if count % 20000 == 0 or count == len(holdout):
+                print(f"  {count:,}/{len(holdout):,} entities featurized  {total_pairs:,} pairs  "
+                      f"({_timer()-t0:.0f}s)", flush=True)
 
     del cosine_scores, dense_cands
     gc.collect()
