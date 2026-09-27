@@ -59,7 +59,7 @@ NUM_FEATURES = BASE_FEATURES + 3  # +cosine, +idf_contain_fwd, +idf_contain_rev
 @dataclass
 class Cfg:
     seed: int = 42
-    holdout_n: int = 100_000
+    holdout_n: int = 10_000
     train_frac: float = 0.7
 
     # BM25
