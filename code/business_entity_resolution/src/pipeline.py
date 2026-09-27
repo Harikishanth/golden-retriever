@@ -82,7 +82,7 @@ class Cfg:
     # needs activation_fn=Sigmoid() for 0-1 probs. Purpose-built reranker,
     # better than fine-tuning mDeBERTa from scratch.)
     ce_model: str = "Qwen/Qwen3-Reranker-0.6B"
-    ce_epochs: int = 3
+    ce_epochs: int = 0
     ce_batch: int = 32
     ce_lr: float = 2e-5
     ce_maxlen: int = 128
@@ -392,8 +392,13 @@ def _train_ce_manual(pairs, labels, cfg: Cfg):
             }
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.ce_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token if tokenizer.eos_token else "<|endoftext|>"
+        tokenizer.pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
     model = AutoModelForSequenceClassification.from_pretrained(
         cfg.ce_model, num_labels=2)
+    if getattr(model.config, "pad_token_id", None) is None:
+        model.config.pad_token_id = tokenizer.pad_token_id
     ds = OnTheFlyDataset(pairs, labels, tokenizer, cfg.ce_maxlen)
     loader = DataLoader(ds, batch_size=cfg.ce_batch * cfg.ce_grad_accum,
                         shuffle=True, num_workers=4)
@@ -428,8 +433,8 @@ def _train_ce_manual(pairs, labels, cfg: Cfg):
 
 
 def predict_ce(model, pairs, batch_size=512):
-    if not pairs:
-        return np.array([], dtype=np.float32)
+    if not pairs or model is None:
+        return np.zeros(len(pairs), dtype=np.float32)
     scores = model.predict(pairs, batch_size=batch_size,
                            show_progress_bar=len(pairs) > 50000,
                            convert_to_numpy=True)
@@ -793,8 +798,12 @@ def run_holdout(cfg: Cfg):
     val_ce_pairs, val_ce_labels = build_ce_pairs(
         s1, pool, gt, val_cands, cfg, rng)
 
-    ce_model = train_cross_encoder(ce_pairs, ce_labels,
-                                   val_ce_pairs, val_ce_labels, cfg)
+    try:
+        ce_model = train_cross_encoder(ce_pairs, ce_labels,
+                                       val_ce_pairs, val_ce_labels, cfg)
+    except Exception as e:
+        print(f"CE training skipped or failed ({e}). Proceeding with LightGBM...", flush=True)
+        ce_model = None
     del ce_pairs, ce_labels, val_ce_pairs, val_ce_labels
     gc.collect()
 
