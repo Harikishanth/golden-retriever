@@ -28,11 +28,12 @@ class DenseRetrieval:
     """Encode entities and retrieve dense nearest neighbors."""
 
     def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B",
-                 device: str = "cuda", batch_size: int = 256,
+                 device: str = "cuda", batch_size: int = 512,
                  truncate_dim: int = 512):
+        import torch
         from sentence_transformers import SentenceTransformer
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name, device=device)
+        self.model = SentenceTransformer(model_name, device=device, model_kwargs={"torch_dtype": torch.bfloat16})
         self.device = device
         self.batch_size = batch_size
         self.truncate_dim = truncate_dim
@@ -50,6 +51,10 @@ class DenseRetrieval:
 
     def _encode(self, texts: list[str], tag: str = "",
                 prompt_name: str | None = None) -> np.ndarray:
+        if self.model is None:
+            import torch
+            from sentence_transformers import SentenceTransformer
+            self.model = SentenceTransformer(self.model_name, device=self.device, model_kwargs={"torch_dtype": torch.bfloat16})
         t0 = time.time()
         kwargs = dict(batch_size=self.batch_size, show_progress_bar=True,
                       normalize_embeddings=True, convert_to_numpy=True)
@@ -179,22 +184,12 @@ class DenseRetrieval:
                 np.array(self._pool_eids, dtype=object))
         print(f"Saved pool index → {path.stem}.*", flush=True)
 
-    def load_pool(self, path: Path, use_gpu: bool = True, n_gpu: int = -1):
+    def load_pool(self, path: Path, use_gpu: bool = False, n_gpu: int = 0):
         import faiss
-        cpu_idx = faiss.read_index(str(path.with_suffix(".faiss")))
-        n_gpus = faiss.get_num_gpus() if use_gpu else 0
-        n_gpus_use = n_gpus if n_gpu == -1 else min(n_gpu, n_gpus)
-        if n_gpus_use > 1:
-            self._index = faiss.index_cpu_to_all_gpus(cpu_idx)
-        elif n_gpus_use == 1:
-            self._gpu_res = faiss.StandardGpuResources()
-            self._index = faiss.index_cpu_to_gpu(self._gpu_res, 0, cpu_idx)
-        else:
-            self._index = cpu_idx
+        self._index = faiss.read_index(str(path.with_suffix(".faiss")))
         self._pool_eids = np.load(
             path.with_suffix(".eids.npy"), allow_pickle=True).tolist()
-        print(f"Loaded pool index: {self._index.ntotal:,} vectors "
-              f"(gpus={n_gpus_use})", flush=True)
+        print(f"Loaded pool CPU index: {self._index.ntotal:,} vectors", flush=True)
 
     # ── multi-GPU parallel pool encoding ─────────────────────────────
 
@@ -204,11 +199,13 @@ class DenseRetrieval:
         Called via multiprocessing for parallel encoding across GPUs.
         """
         model_name, truncate_dim, batch_size, texts, gpu_id, out_path = args
-        import os
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        import torch
+        torch.cuda.set_device(gpu_id)
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(model_name, device="cuda")
-        kwargs = dict(batch_size=batch_size, show_progress_bar=True,
+        device_str = f"cuda:{gpu_id}"
+        model = SentenceTransformer(model_name, device=device_str, model_kwargs={"torch_dtype": torch.bfloat16})
+        model.max_seq_length = 128
+        kwargs = dict(batch_size=256, show_progress_bar=True,
                       normalize_embeddings=True, convert_to_numpy=True,
                       prompt_name="document")
         emb = model.encode(texts, **kwargs).astype("float32")
@@ -243,35 +240,133 @@ class DenseRetrieval:
         eids, texts = self._texts(pool)
         self._pool_eids = eids
 
-        # Split into shards
-        shard_size = (len(texts) + n_gpus - 1) // n_gpus
-        args_list = []
-        for gpu_id in range(n_gpus):
-            start = gpu_id * shard_size
-            end = min(start + shard_size, len(texts))
-            out_path = str(tmp_dir / f"shard_{gpu_id}.npy")
-            args_list.append((
-                self.model_name, self.truncate_dim, self.batch_size,
-                texts[start:end], gpu_id, out_path,
-            ))
+        # Check and combine existing part files into full shard files
+        for i in range(n_gpus):
+            shard_p = tmp_dir / f"shard_{i}.npy"
+            p0 = tmp_dir / f"shard_{i}_part0.npy"
+            p1 = tmp_dir / f"shard_{i}_part1.npy"
+            if not shard_p.exists() and p0.exists() and p1.exists():
+                print(f"Combining existing parts for shard_{i}...", flush=True)
+                emb0 = np.load(str(p0))
+                emb1 = np.load(str(p1))
+                full_emb = np.concatenate([emb0, emb1], axis=0)
+                np.save(str(shard_p), full_emb)
+                del emb0, emb1, full_emb
+                gc.collect()
+                p0.unlink()
+                p1.unlink()
+                print(f"  Combined existing parts → shard_{i}.npy", flush=True)
+
+        # Check existing full shards on disk
+        shard_paths = [tmp_dir / f"shard_{i}.npy" for i in range(n_gpus)]
+        missing_gpus = [i for i, p in enumerate(shard_paths) if not p.exists()]
+
+        if missing_gpus:
+            print(f"Missing shards to encode: {missing_gpus} — checking existing part files...", flush=True)
+            shard_size = (len(texts) + n_gpus - 1) // n_gpus
+            tasks = []
+            for shard_id in missing_gpus:
+                start = shard_id * shard_size
+                end = min(start + shard_size, len(texts))
+                shard_texts = texts[start:end]
+                mid = len(shard_texts) // 2
+                
+                p0 = tmp_dir / f"shard_{shard_id}_part0.npy"
+                p1 = tmp_dir / f"shard_{shard_id}_part1.npy"
+                
+                if not p0.exists():
+                    sub_texts = shard_texts[:mid]
+                    sub_chunk = (len(sub_texts) + n_gpus - 1) // n_gpus
+                    for g in range(n_gpus):
+                        s_idx = g * sub_chunk
+                        e_idx = min(s_idx + sub_chunk, len(sub_texts))
+                        t_slice = sub_texts[s_idx:e_idx]
+                        if t_slice:
+                            out_path = str(tmp_dir / f"shard_{shard_id}_part0_sub{g}.npy")
+                            tasks.append((g, t_slice, out_path))
+                else:
+                    print(f"  Part file {p0.name} already exists on disk — skipping!", flush=True)
+
+                if not p1.exists():
+                    sub_texts = shard_texts[mid:]
+                    sub_chunk = (len(sub_texts) + n_gpus - 1) // n_gpus
+                    for g in range(n_gpus):
+                        s_idx = g * sub_chunk
+                        e_idx = min(s_idx + sub_chunk, len(sub_texts))
+                        t_slice = sub_texts[s_idx:e_idx]
+                        if t_slice:
+                            out_path = str(tmp_dir / f"shard_{shard_id}_part1_sub{g}.npy")
+                            tasks.append((g, t_slice, out_path))
+                else:
+                    print(f"  Part file {p1.name} already exists on disk — skipping!", flush=True)
+
+            if tasks:
+                args_list = []
+                for gpu_id, sub_texts, out_path in tasks:
+                    args_list.append((
+                        self.model_name, self.truncate_dim, 512,
+                        sub_texts, gpu_id, out_path,
+                    ))
+
+                t0 = time.time()
+                if hasattr(self, "model") and self.model is not None:
+                    del self.model
+                    self.model = None
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+                ctx = mp.get_context("spawn")
+                with ctx.Pool(processes=len(args_list)) as pool_mp:
+                    pool_mp.map(DenseRetrieval.encode_shard, args_list)
+                print(f"Remaining sub-shards encoded across {n_gpus} GPUs in {time.time()-t0:.0f}s", flush=True)
+
+            # Combine sub-parts into part0/part1 and full shard files
+            for shard_id in missing_gpus:
+                for part_id in [0, 1]:
+                    part_path = tmp_dir / f"shard_{shard_id}_part{part_id}.npy"
+                    if not part_path.exists():
+                        sub_files = [tmp_dir / f"shard_{shard_id}_part{part_id}_sub{g}.npy" for g in range(n_gpus)]
+                        if all(f.exists() for f in sub_files):
+                            print(f"Combining {len(sub_files)} sub-parts for shard_{shard_id}_part{part_id}...", flush=True)
+                            arrs = [np.load(str(f)) for f in sub_files]
+                            merged = np.concatenate(arrs, axis=0)
+                            np.save(str(part_path), merged)
+                            del arrs, merged
+                            gc.collect()
+                            for f in sub_files:
+                                f.unlink()
+                            print(f"  Saved combined {part_path.name}", flush=True)
+
+                p0 = tmp_dir / f"shard_{shard_id}_part0.npy"
+                p1 = tmp_dir / f"shard_{shard_id}_part1.npy"
+                if p0.exists() and p1.exists():
+                    emb0 = np.load(str(p0))
+                    emb1 = np.load(str(p1))
+                    full_emb = np.concatenate([emb0, emb1], axis=0)
+                    np.save(str(tmp_dir / f"shard_{shard_id}.npy"), full_emb)
+                    del emb0, emb1, full_emb
+                    gc.collect()
+                    p0.unlink()
+                    p1.unlink()
+                    print(f"  Combined parts → shard_{shard_id}.npy", flush=True)
+        else:
+            print("All shards already exist on disk! Skipping encoding.", flush=True)
+
+        # Merge shards into FAISS CPU index (uses 186GB RAM + 48 vCPUs, zero GPU OOM)
+        dim = self.truncate_dim or 512
+        self._index = faiss.IndexFlatIP(dim)
+        print("Building FAISS CPU index on 186GB RAM across 48 vCPUs...", flush=True)
 
         t0 = time.time()
-        with mp.Pool(processes=n_gpus) as pool_mp:
-            pool_mp.map(DenseRetrieval.encode_shard, args_list)
-        print(f"All shards encoded in {time.time()-t0:.0f}s", flush=True)
-
-        # Merge shards into FAISS index
-        dim = self.truncate_dim or self.model.get_sentence_embedding_dimension()
-        cpu_index = faiss.IndexFlatIP(dim)
-        self._index = faiss.index_cpu_to_all_gpus(cpu_index)
-
         for gpu_id in range(n_gpus):
             shard_path = tmp_dir / f"shard_{gpu_id}.npy"
             emb = np.load(str(shard_path))
             self._index.add(emb)
+            print(f"  Added shard_{gpu_id}.npy ({len(emb):,} vectors)", flush=True)
             del emb
             gc.collect()
-            shard_path.unlink()
 
-        print(f"FAISS multi-GPU index: {self._index.ntotal:,} vectors, "
-              f"{n_gpus} GPUs, {time.time()-t0:.0f}s total", flush=True)
+        print(f"FAISS CPU index built: {self._index.ntotal:,} vectors, "
+              f"dim={dim}, {time.time()-t0:.1f}s total", flush=True)
